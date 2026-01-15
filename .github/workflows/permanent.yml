@@ -1,0 +1,354 @@
+name: Permanent SSH Node
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # 根据用户设置的TTL自动生成
+  workflow_dispatch:              # 支持手动触发
+  repository_dispatch:            # 支持通过 API 触发
+    types: [restart-permanent-node]
+
+permissions:
+  contents: write
+  actions: write  # 允许触发其他 workflow
+
+# 并发控制：新运行会取消旧运行，实现无缝切换
+concurrency:
+  group: permanent-ssh-node
+  cancel-in-progress: true
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install OpenSSH & bore & davfs2
+        run: |
+          set -e
+          echo ">>> Install OpenSSH, curl, openssl, davfs2"
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y openssh-server curl openssl davfs2
+          elif command -v yum >/dev/null 2>&1; then
+            sudo yum install -y openssh-server curl openssl davfs2
+          else
+            echo "Unsupported package manager, please install openssh-server & curl & openssl & davfs2 manually."
+            exit 1
+          fi
+
+          echo ">>> Detect arch & download bore"
+          ARCH="$(uname -m)"
+          echo "Detected arch: $ARCH"
+
+          if [ "$ARCH" = "x86_64" ]; then
+            BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz"
+          else
+            # 其它架构按 ARM 处理（aarch64 musl 版本）
+            BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-aarch64-unknown-linux-musl.tar.gz"
+          fi
+
+          echo "Downloading bore from $BORE_URL ..."
+          curl -L "$BORE_URL" -o bore.tar.gz
+
+          echo "Extract bore ..."
+          tar -xzf bore.tar.gz
+
+          if [ -f bore ]; then
+            :
+          else
+            # 从解压目录里找一个 bore 可执行文件
+            BORE_BIN="$(find . -maxdepth 3 -type f -name 'bore' | head -n 1 || true)"
+            if [ -z "$BORE_BIN" ]; then
+              echo "Failed to find bore binary after extract."
+              ls -R .
+              exit 1
+            fi
+            mv "$BORE_BIN" bore
+          fi
+
+          chmod +x bore
+          echo ">>> bore installed:"
+          ./bore --help >/dev/null 2>&1 || true
+
+      - name: Mount WebDAV, configure SSH, start bore tunnels and save endpoints
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_TTL_MINUTES: "360"
+          NODE_WEB_PORTS: "80 1000 9000 8080 5050 6060 8800 5650 443"
+          WEBDAV_URL: "${{ secrets.WEBDAV_URL }}"
+          WEBDAV_USER: "${{ secrets.WEBDAV_USER }}"
+          WEBDAV_PASS: "${{ secrets.WEBDAV_PASS }}"
+        run: |
+          set -euo pipefail
+
+          TTL_MIN=${NODE_TTL_MINUTES:-60}
+          TTL_SEC=$(( TTL_MIN * 60 ))
+          PORT_LIST_STR="${NODE_WEB_PORTS:-}"
+
+          echo ">>> TTL (minutes): $TTL_MIN"
+          echo ">>> Extra TCP ports to expose via bore: ${PORT_LIST_STR:-<none>}"
+
+          # ===== WebDAV 挂载到 /data =====
+          WEBDAV_URL="${WEBDAV_URL:-}"
+          WEBDAV_USER="${WEBDAV_USER:-}"
+          WEBDAV_PASS="${WEBDAV_PASS:-}"
+
+          if [ -n "$WEBDAV_URL" ] && [ -n "$WEBDAV_USER" ] && [ -n "$WEBDAV_PASS" ]; then
+            echo ">>> Mounting WebDAV to /data directory..."
+            
+            # 创建挂载点
+            sudo mkdir -p /data
+            
+            # 配置 davfs2 认证
+            echo "$WEBDAV_URL $WEBDAV_USER $WEBDAV_PASS" | sudo tee -a /etc/davfs2/secrets
+            sudo chmod 600 /etc/davfs2/secrets
+            
+            # 配置 davfs2 选项（允许普通用户访问）
+            echo "use_locks 0" | sudo tee -a /etc/davfs2/davfs2.conf
+            echo "ask_auth 0" | sudo tee -a /etc/davfs2/davfs2.conf
+            
+            # 挂载 WebDAV 到 /data
+            if sudo mount -t davfs "$WEBDAV_URL" /data; then
+              echo ">>> WebDAV mounted successfully at /data"
+              
+              # 设置权限，让 root 用户可以访问
+              sudo chown root:root /data
+              sudo chmod 755 /data
+              
+              # 显示挂载信息
+              df -h /data || true
+              ls -la /data || true
+              
+              echo ">>> Permanent storage is available at /data"
+              echo ">>> All files saved in /data will persist across node recreations"
+            else
+              echo "!!! WebDAV mount failed, continuing without persistent storage"
+              echo "!!! Node will work normally but data will not persist"
+            fi
+          else
+            echo ">>> WebDAV not configured, /data will be local storage only"
+            sudo mkdir -p /data
+            sudo chown root:root /data
+            echo ">>> Created local /data directory (data will not persist)"
+          fi
+
+          # 执行重启命令文件（如果存在）
+          REBOOT_FILE="reboot.txt"
+          
+          if [ -f "$REBOOT_FILE" ]; then
+            echo ">>> Found $REBOOT_FILE, executing commands..."
+            echo ">>> Working directory: /root"
+            
+            # 使用 sudo 切换到 /root 目录执行命令
+            sudo bash -c "cd /root && while IFS= read -r cmd || [ -n \"\$cmd\" ]; do
+              # 跳过空行和注释行
+              if [ -z \"\$cmd\" ] || [[ \"\$cmd\" =~ ^[[:space:]]*# ]]; then
+                continue
+              fi
+              
+              echo \">>> Executing: \$cmd\"
+              eval \"\$cmd\" || echo \"!!! Command failed: \$cmd\"
+            done < \"$GITHUB_WORKSPACE/$REBOOT_FILE\""
+            
+            echo ">>> Finished executing $REBOOT_FILE commands"
+          else
+            echo ">>> No $REBOOT_FILE found, skipping custom commands"
+          fi
+
+          echo ">>> Configure & start OpenSSH server"
+          sudo mkdir -p /var/run/sshd
+
+          # 检查是否有保存的密码（从 ssh.txt 读取）
+          SAVED_PASSWORD=""
+          if [ -f ssh.txt ]; then
+            SAVED_PASSWORD=$(grep -oP '(?<=password: ).+' ssh.txt 2>/dev/null || true)
+            if [ -n "$SAVED_PASSWORD" ]; then
+              echo ">>> Found saved password from ssh.txt, reusing it"
+              ROOT_PASS="$SAVED_PASSWORD"
+            fi
+          fi
+          
+          # 如果没有保存的密码，生成新密码
+          if [ -z "${ROOT_PASS:-}" ]; then
+            ROOT_PASS="$(openssl rand -base64 18 | tr -d '=+/' | head -c 16)"
+            echo ">>> Generated new root password (first run)"
+          fi
+
+          # 设置 root 密码
+          echo "root:${ROOT_PASS}" | sudo chpasswd
+
+          # 恢复 SSH host keys（如果存在）
+          if [ -d key ]; then
+            echo ">>> Found saved SSH host keys, restoring..."
+            sudo cp -f key/* /etc/ssh/
+            sudo chmod 600 /etc/ssh/ssh_host_*_key
+            sudo chmod 644 /etc/ssh/ssh_host_*_key.pub
+            echo ">>> SSH host keys restored"
+          else
+            echo ">>> No saved SSH host keys found, will generate new ones"
+          fi
+
+          # 调整 sshd 配置：允许 root & 密码登录
+          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config || true
+
+          # 启动 sshd（会自动生成缺失的 host keys）
+          sudo /usr/sbin/sshd -D -e &
+          SSHD_PID=$!
+          echo ">>> sshd started with PID $SSHD_PID"
+          
+          # 等待 sshd 生成 host keys
+          sleep 2
+          
+          # 备份 SSH host keys 到仓库（首次运行或 keys 更新时）
+          if [ ! -d key ]; then
+            echo ">>> Backing up SSH host keys..."
+            mkdir -p key
+            sudo cp /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub key/
+            sudo chmod 644 key/*
+            echo ">>> SSH host keys backed up to key/"
+          fi
+
+          rm -f bore_*.log bore_ssh.log
+
+          echo ">>> Start bore tunnel for SSH (local port 22)"
+          
+          # 检查是否有保存的 SSH 端口（从 ssh.txt 解析）
+          SAVED_SSH_PORT=""
+          if [ -f ssh.txt ]; then
+            SAVED_SSH_PORT=$(grep -oP '(?<=-p )\d+' ssh.txt 2>/dev/null || true)
+            if [ -n "$SAVED_SSH_PORT" ]; then
+              echo ">>> Found saved SSH port from ssh.txt: $SAVED_SSH_PORT"
+            fi
+          fi
+          
+          # 启动 bore tunnel
+          if [ -n "$SAVED_SSH_PORT" ]; then
+            echo ">>> Using saved remote port: $SAVED_SSH_PORT"
+            nohup ./bore local 22 --to bore.pub --port "$SAVED_SSH_PORT" > bore_ssh.log 2>&1 &
+          else
+            echo ">>> Using random remote port (first run)"
+            nohup ./bore local 22 --to bore.pub > bore_ssh.log 2>&1 &
+          fi
+
+          # 额外 TCP 端口（可为空：不填就是只开 SSH，不建任何端口映射）
+          read -ra PORTS <<< "$PORT_LIST_STR"
+          if [ "${#PORTS[@]}" -gt 0 ]; then
+            echo ">>> Start bore tunnels for extra TCP ports ..."
+            for p in "${PORTS[@]}"; do
+              p_trim="$(echo "$p" | xargs || true)"
+              if [ -z "$p_trim" ]; then
+                continue
+              fi
+              log_file="bore_${p_trim}.log"
+              echo "  - launching bore tunnel for local port $p_trim ..."
+              nohup ./bore local "$p_trim" --to bore.pub > "$log_file" 2>&1 &
+            done
+          fi
+
+          echo ">>> Waiting for bore to establish tunnels ..."
+          sleep 10
+
+          SSH_HOST="nat.mugassn.dpdns.org"
+
+          # 解析 SSH 远程端口
+          SSH_REMOTE_PORT="$(grep -Eo 'bore\.pub:[0-9]+' bore_ssh.log | head -n 1 | sed 's/.*://')"
+          if [ -z "${SSH_REMOTE_PORT:-}" ]; then
+            echo "!!! 未能从 bore_ssh.log 中解析 SSH 远端端口"
+          else
+            SSH_CMD="ssh root@${SSH_HOST} -p ${SSH_REMOTE_PORT}"
+            echo ">>> SSH command: ${SSH_CMD}"
+
+            {
+              echo "${SSH_CMD}"
+              echo "password: ${ROOT_PASS}"
+            } > ssh.txt
+          fi
+
+          # 解析额外 TCP 端口并写入 web.txt
+          > web.txt
+          if [ "${#PORTS[@]}" -gt 0 ]; then
+            echo ">>> Parsing bore remote endpoints for extra ports ..."
+            for p in "${PORTS[@]}"; do
+              p_trim="$(echo "$p" | xargs || true)"
+              if [ -z "$p_trim" ]; then
+                continue
+              fi
+              log_file="bore_${p_trim}.log"
+              if [ -f "$log_file" ]; then
+                REMOTE_PORT="$(grep -Eo 'bore\.pub:[0-9]+' "$log_file" | head -n 1 | sed 's/.*://')"
+                if [ -n "${REMOTE_PORT:-}" ]; then
+                  PUBLIC="${SSH_HOST}:${REMOTE_PORT}"
+                  echo ">>> Bore tunnel for local port ${p_trim}: ${PUBLIC}"
+                  echo "${p_trim} ${PUBLIC}" >> web.txt
+                else
+                  echo "!!! 未能从 bore 日志中解析远端端口 (local=${p_trim})"
+                fi
+              else
+                echo "!!! bore 日志文件不存在: ${log_file}"
+              fi
+            done
+          fi
+
+          echo ">>> Configure git & push ssh.txt / web.txt / key/ ..."
+          git config user.name "permanent-node-automation"
+          git config user.email "permanent-node-automation@noreply.local"
+
+          git add ssh.txt web.txt key/ || true
+          TS="$(date -u +%Y%m%dT%H%M%SZ)"
+          git commit -m "chore: update permanent node endpoints $TS" || echo "Nothing to commit"
+
+          REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push "$REMOTE_URL" HEAD:${GITHUB_REF_NAME} || echo "git push failed (non-fatal)"
+
+          echo ">>> Permanent node ready! WebDAV mounted at /data"
+          echo ">>> Running for ${TTL_MIN} minutes..."
+          
+          # 等待到 TTL 结束
+          sleep "$TTL_SEC" || true
+          
+          echo ">>> TTL reached, executing shutdown commands if any..."
+          
+          # 执行关机前命令（如果存在）
+          SHUTDOWN_FILE="shut.txt"
+          if [ -f "$SHUTDOWN_FILE" ]; then
+            echo ">>> Found $SHUTDOWN_FILE, executing shutdown commands..."
+            echo ">>> Working directory: /root"
+            
+            # 使用 sudo 切换到 /root 目录执行命令
+            sudo bash -c "cd /root && while IFS= read -r cmd || [ -n \"\$cmd\" ]; do
+              # 跳过空行和注释行
+              if [ -z \"\$cmd\" ] || [[ \"\$cmd\" =~ ^[[:space:]]*# ]]; then
+                continue
+              fi
+              
+              echo \">>> Executing: \$cmd\"
+              eval \"\$cmd\" || echo \"!!! Command failed: \$cmd\"
+            done < \"$GITHUB_WORKSPACE/$SHUTDOWN_FILE\""
+            
+            echo ">>> Finished executing $SHUTDOWN_FILE commands"
+          else
+            echo ">>> No $SHUTDOWN_FILE found, skipping shutdown commands"
+          fi
+          
+          echo ">>> Triggering next run to replace this one..."
+          
+          # 触发新运行（会自动取消当前运行）
+          curl -s -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/dispatches" \
+            -d '{"event_type":"restart-permanent-node"}' || echo "Trigger failed, cron will handle restart"
+          
+          echo ">>> New run triggered, current run will be cancelled automatically"
+          echo ">>> Waiting for cancellation..."
+          
+          # 等待被新运行取消（最多等待5分钟）
+          sleep 300
