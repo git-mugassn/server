@@ -1,0 +1,9 @@
+80 nat.mugassn.dpdns.org:49425
+1000 nat.mugassn.dpdns.org:65298
+9000 nat.mugassn.dpdns.org:22019
+8080 nat.mugassn.dpdns.org:43211
+5050 nat.mugassn.dpdns.org:31381
+6060 nat.mugassn.dpdns.org:63207
+8800 nat.mugassn.dpdns.org:39130
+5650 nat.mugassn.dpdns.org:20451
+443 nat.mugassn.dpdns.org:43541
